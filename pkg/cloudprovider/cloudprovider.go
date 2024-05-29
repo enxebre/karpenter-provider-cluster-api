@@ -20,15 +20,30 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net/http"
 
+	awsv1beta1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1beta1"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/pkg/logging"
+	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	capiexpv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/karpenter-provider-cluster-api/pkg/providers/machine"
 	"sigs.k8s.io/karpenter-provider-cluster-api/pkg/providers/machinedeployment"
 	"sigs.k8s.io/karpenter/pkg/apis/v1beta1"
+	corev1beta1 "sigs.k8s.io/karpenter/pkg/apis/v1beta1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 const (
@@ -43,52 +58,183 @@ const (
 	maxPodsKey      = "capacity.cluster-autoscaler.kubernetes.io/maxPods"
 )
 
-func NewCloudProvider(ctx context.Context, kubeClient client.Client, machineProvider machine.Provider, machineDeploymentProvider machinedeployment.Provider) *CloudProvider {
+var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
+
+func NewCloudProvider(instanceTypeProvider InstanceTypeProvider, instanceProvider InstanceProvider, recorder events.Recorder, kubeClient client.Client) *CloudProvider {
 	return &CloudProvider{
-		kubeClient:                kubeClient,
-		machineProvider:           machineProvider,
-		machineDeploymentProvider: machineDeploymentProvider,
+		instanceProvider:     instanceProvider,
+		instanceTypeProvider: instanceTypeProvider,
+		kubeClient:           kubeClient,
+		recorder:             recorder,
 	}
 }
 
+// Providers implement this leverage cloud provider specific
+type InstanceTypeProvider interface {
+	LivenessProbe(*http.Request) error
+	// TODO(alberto): change this interface to use unstructured instead of *awsv1beta1.EC2NodeClass.
+	// Or NodeClaim, so providers can call resolveNodeClassFromNodeClaim themselves.
+	// so it can be satisfied by multiple providers
+	List(context.Context, *corev1beta1.KubeletConfiguration, *awsv1beta1.EC2NodeClass) ([]*cloudprovider.InstanceType, error)
+	UpdateInstanceTypes(ctx context.Context) error
+	UpdateInstanceTypeOfferings(ctx context.Context) error
+}
+
+// Providers implement this leverage cloud provider specific pricing APIs to provide pricing information.
+type PricingProvider interface {
+	LivenessProbe(*http.Request) error
+	InstanceTypes() []string
+	OnDemandPrice(string) (float64, bool)
+	SpotPrice(string, string) (float64, bool)
+	UpdateOnDemandPricing(context.Context) error
+	UpdateSpotPricing(context.Context) error
+}
+
+// Providers implement this to create provider specific MachinePools with CAPI cloud provider.
+// e.g awsMachinePool, azureMachinePool, etc.
+type InstanceProvider interface {
+	Create(context.Context, *corev1beta1.NodeClaim, []*cloudprovider.InstanceType) (*v1.ObjectReference, error)
+	Get(context.Context, string) error
+	List(context.Context) error
+	Delete(context.Context, string) error
+	CreateTags(context.Context, string, map[string]string) error
+}
+
 type CloudProvider struct {
-	kubeClient                client.Client
+	instanceTypeProvider InstanceTypeProvider
+	instanceProvider     InstanceProvider
+	recorder             events.Recorder
+	kubeClient           client.Client
+
+	// Below this line in unsued by this poc.
 	machineProvider           machine.Provider
 	machineDeploymentProvider machinedeployment.Provider
 }
 
-func (c CloudProvider) Create(ctx context.Context, nodeClaim *v1beta1.NodeClaim) (*v1beta1.NodeClaim, error) {
-	return nil, fmt.Errorf("not implemented")
+func (c *CloudProvider) GetSupportedNodeClasses() []schema.GroupVersionKind {
+	return []schema.GroupVersionKind{
+		{
+			Group:   v1beta1.SchemeGroupVersion.Group,
+			Version: v1beta1.SchemeGroupVersion.Version,
+			Kind:    "EC2NodeClass",
+		},
+	}
 }
 
-func (c CloudProvider) Delete(ctx context.Context, nodeClaim *v1beta1.NodeClaim) error {
+func (c *CloudProvider) LivenessProbe(req *http.Request) error {
+	return c.instanceTypeProvider.LivenessProbe(req)
+}
+
+func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeClaim *corev1beta1.NodeClaim) (*unstructured.Unstructured, error) {
+	nodeClass := &unstructured.Unstructured{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+		return nil, err
+	}
+	// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound
+	if !nodeClass.GetDeletionTimestamp().IsZero() {
+		// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound,
+		// but we return a different error message to be clearer to users
+		return nil, fmt.Errorf("nodeClass %s is being deleted", nodeClass.GetName())
+	}
+	return nodeClass, nil
+}
+
+func (c *CloudProvider) Create(ctx context.Context, nodeClaim *v1beta1.NodeClaim) (*v1beta1.NodeClaim, error) {
+	ctx = logging.WithLogger(ctx, logging.FromContext(ctx).With("nodeClaim -> CAPI call to create -> CAPA call to asg/fleet", nodeClaim))
+
+	nodeClass, err := c.resolveNodeClassFromNodeClaim(ctx, nodeClaim)
+	if err != nil {
+		return nil, fmt.Errorf("resolving node class, %w", err)
+	}
+
+	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
+	if err != nil {
+		return nil, fmt.Errorf("resolving instance types, %w", err)
+	}
+	if len(instanceTypes) == 0 {
+		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("all requested instance types were unavailable during launch"))
+	}
+
+	providerMachinePoolRef, err := c.instanceProvider.Create(ctx, nodeClaim, instanceTypes)
+	if err != nil {
+		return nil, fmt.Errorf("creating provider MachinePool, %w", err)
+	}
+
+	machinePool := &capiexpv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            nodeClaim.Name,
+			Namespace:       "",
+			Labels:          map[string]string{},
+			Annotations:     map[string]string{},
+			OwnerReferences: []metav1.OwnerReference{},
+		},
+		// Populate the fields with empty values
+		Spec: capiexpv1.MachinePoolSpec{
+			ClusterName: "",
+			Replicas:    new(int32),
+			Template: capiv1.MachineTemplateSpec{
+				Spec: capiv1.MachineSpec{
+					ClusterName: "",
+					Bootstrap:   capiv1.Bootstrap{
+						// TODO (alberto) inject OCP user data here.
+					},
+					InfrastructureRef:       *providerMachinePoolRef,
+					Version:                 new(string),
+					ProviderID:              new(string),
+					FailureDomain:           new(string),
+					NodeDrainTimeout:        &metav1.Duration{},
+					NodeVolumeDetachTimeout: &metav1.Duration{},
+					NodeDeletionTimeout:     &metav1.Duration{},
+				},
+			},
+			MinReadySeconds: new(int32),
+			ProviderIDList:  []string{},
+			FailureDomains:  []string{},
+		},
+	}
+
+	if err := c.kubeClient.Create(ctx, machinePool); err != nil {
+		return nil, fmt.Errorf("creating MachinePool, %w", err)
+	}
+
+	// TODO (alberto): The instanceType could be contractually coming from infraMachinePool.status.InstanceType
+	// So we read it via unstructured here for any provider.
+	// instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
+	// 	return i.Name == string(lo.FromPtr(infraMachinePool.status.InstanceType))
+	// })
+	//return c.instanceToNodeClaim(machinePool, instanceType)
+	return nil, nil
+}
+
+func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *v1beta1.NodeClaim) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (c CloudProvider) Get(ctx context.Context, providerID string) (*v1beta1.NodeClaim, error) {
+func (c *CloudProvider) Get(ctx context.Context, providerID string) (*v1beta1.NodeClaim, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (c CloudProvider) List(ctx context.Context) ([]*v1beta1.NodeClaim, error) {
-	machines, err := c.machineProvider.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing machines, %w", err)
-	}
+func (c *CloudProvider) List(ctx context.Context) ([]*v1beta1.NodeClaim, error) {
+	// machines, err := c.machineProvider.List(ctx)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("listing machines, %w", err)
+	// }
 
-	var nodeClaims []*v1beta1.NodeClaim
-	for _, machine := range machines {
-		nodeClaim, err := c.machineToNodeClaim(ctx, machine)
-		if err != nil {
-			return []*v1beta1.NodeClaim{}, err
-		}
-		nodeClaims = append(nodeClaims, nodeClaim)
-	}
+	// var nodeClaims []*v1beta1.NodeClaim
+	// for _, machine := range machines {
+	// 	nodeClaim, err := c.machineToNodeClaim(ctx, machine)
+	// 	if err != nil {
+	// 		return []*v1beta1.NodeClaim{}, err
+	// 	}
+	// 	nodeClaims = append(nodeClaims, nodeClaim)
+	// }
 
-	return nodeClaims, nil
+	// return nodeClaims, nil
+	return nil, nil
 }
 
 // Return the hard-coded instance types.
-func (c CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *v1beta1.NodePool) ([]*cloudprovider.InstanceType, error) {
+func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *v1beta1.NodePool) ([]*cloudprovider.InstanceType, error) {
 	instanceTypes := []*cloudprovider.InstanceType{}
 
 	if nodePool == nil {
@@ -107,15 +253,15 @@ func (c CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *v1beta1.N
 }
 
 // Return nothing since there's no cloud provider drift.
-func (c CloudProvider) IsDrifted(ctx context.Context, nodeClaim *v1beta1.NodeClaim) (cloudprovider.DriftReason, error) {
+func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *v1beta1.NodeClaim) (cloudprovider.DriftReason, error) {
 	return "", nil
 }
 
-func (c CloudProvider) Name() string {
+func (c *CloudProvider) Name() string {
 	return "clusterapi"
 }
 
-func (c CloudProvider) machineToNodeClaim(ctx context.Context, machine *capiv1beta1.Machine) (*v1beta1.NodeClaim, error) {
+func (c *CloudProvider) machineToNodeClaim(ctx context.Context, machine *capiv1beta1.Machine) (*v1beta1.NodeClaim, error) {
 	nodeClaim := v1beta1.NodeClaim{}
 	if machine.Spec.ProviderID != nil {
 		nodeClaim.Status.ProviderID = *machine.Spec.ProviderID
@@ -156,4 +302,19 @@ func (c CloudProvider) machineToNodeClaim(ctx context.Context, machine *capiv1be
 	nodeClaim.Status.Capacity = capacity
 
 	return &nodeClaim, nil
+}
+
+// Filter out instance types that don't meet the requirements
+func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *corev1beta1.NodeClaim, nodeClass *unstructured.Unstructured) ([]*cloudprovider.InstanceType, error) {
+	// See comment no InstanceTypeProvider interface re EC2NodeClass.
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClaim.Spec.Kubelet, &awsv1beta1.EC2NodeClass{})
+	if err != nil {
+		return nil, fmt.Errorf("getting instance types, %w", err)
+	}
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+		return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil &&
+			len(i.Offerings.Compatible(reqs).Available()) > 0 &&
+			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
+	}), nil
 }
